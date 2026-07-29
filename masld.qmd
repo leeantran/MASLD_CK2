@@ -1,0 +1,162 @@
+---
+title: "MASLD"
+format: docx
+---
+
+```{r}
+library(readxl)
+library(tidyverse)
+library(janitor)
+library(ggpubr)
+library(gtsummary)
+library(ggcorrplot)
+```
+
+```{r}
+df <- read_xlsx("data.xlsx", sheet = "Sheet3")
+```
+
+```{r}
+df <- df |> clean_names()
+colnames(df)
+```
+
+```{r}
+df_clean <- df %>%
+  mutate(
+    # 1. Phân độ gan nhiễm mỡ (Steatosis Grades)
+    muc_do_nhiem_mo = case_when(
+      cap < 248 ~ "S0",
+      cap >= 248 & cap <= 267 ~ "S1",
+      cap >= 268 & cap <= 279 ~ "S2",
+      cap >= 280 ~ "S3",
+      TRUE ~ NA_character_
+    ),
+    
+    # 2. Phân độ xơ hóa (Fibrosis Grades - Tạm dùng cut-off FibroScan)
+    muc_do_xo_hoa = case_when(
+      fibro < 7.0 ~ "F0-F1",
+      fibro >= 7.0 & fibro < 9.5 ~ "F2",
+      fibro >= 9.5 & fibro < 12.5 ~ "F3",
+      fibro >= 12.5 ~ "F4",
+      TRUE ~ NA_character_
+    ),
+    
+    # 3. Yếu tố RLCH (Biến 0/1)
+    co_rlch = if_else(
+      vong_eo_90_m_80_f == 1 |
+      glucose_100_mg_dl == 1 |
+      hba1c_5_7_percent == 1 | # Tùy clean_names() ra chữ percent hay không
+      dtd2 == 1 |
+      ha_130_85 == 1 |
+      tha == 1 |
+      triglyceride_150_5mg_dl == 1 |
+      hdl_40_m_50_f == 1 |
+      thuoc_lipid == 1,
+      1, 0
+    ),
+    
+    # 4. Chẩn đoán BGNMLQRLCH (MASLD)
+    bgnmlqrlch_chuan_doan = if_else(cap >= 248 & co_rlch == 1, "Có", "Không"),
+    bgnmlqrlch_binary = if_else(cap >= 248 & co_rlch == 1, 1, 0)
+  )
+```
+
+```{r}
+# Bảng 1: Chỉ số TyG-WC và FLI theo chẩn đoán BGNMLQRLCH
+tbl_bgnmlqrlch <- df_clean %>%
+  select(bgnmlqrlch_chuan_doan, ty_g_wc_index, fli_index) %>%
+  filter(!is.na(bgnmlqrlch_chuan_doan)) |> 
+  tbl_summary(
+    by = bgnmlqrlch_chuan_doan,
+    missing = "no",
+    statistic = list(all_continuous() ~ "{median} ({p25}, {p75})"), # Hoặc {mean} ({sd}) tùy phân phối
+    label = list(
+      ty_g_wc_index ~ "Chỉ số TyG-WC",
+      fli_index ~ "Chỉ số FLI"
+    )
+  ) %>%
+  add_p() %>%
+  add_overall() %>%
+  modify_caption("**Bảng 1. So sánh TyG-WC và FLI theo chẩn đoán BGNMLQRLCH**")
+
+tbl_bgnmlqrlch
+
+# Bảng 2: Chỉ số TyG-WC và FLI theo mức độ nhiễm mỡ (S0-S3)
+tbl_nhiem_mo <- df_clean %>%
+  select(muc_do_nhiem_mo, ty_g_wc_index, fli_index) %>%
+  filter(!is.na(muc_do_nhiem_mo)) %>%
+  tbl_summary(
+    by = muc_do_nhiem_mo,
+    missing = "no",
+    statistic = list(all_continuous() ~ "{median} ({p25}, {p75})")
+  ) %>%
+  add_p() |> 
+  add_overall() %>%
+  modify_caption("**Bảng 2. So sánh TyG-WC và FLI theo mức độ nhiễm mỡ**")
+
+tbl_nhiem_mo
+
+# Bảng 3: Chỉ số TyG-WC và FLI theo mức độ xơ hóa (F0-F4)
+tbl_xo_hoa <- df_clean %>%
+  select(muc_do_xo_hoa, ty_g_wc_index, fli_index) %>%
+  filter(!is.na(muc_do_xo_hoa)) %>%
+  tbl_summary(
+    by = muc_do_xo_hoa,
+    missing = "no",
+    statistic = list(all_continuous() ~ "{median} ({p25}, {p75})")
+  ) %>%
+  add_p() |> 
+  add_overall() %>%
+  modify_caption("**Bảng 3. So sánh TyG-WC và FLI theo mức độ xơ hóa**")
+
+tbl_xo_hoa
+```
+
+```{r, fig.path="figures/", fig.height=7, fig.width=6, dpi=300}
+df_quant <- df_clean %>%
+  mutate(tuoi = 2026 - nam_sinh) %>% # Tính tuổi từ năm sinh
+  # Chỉ chọn những biến thực sự là định lượng liên tục
+  select(tuoi, bmi, ggt, cap, fibro, ty_g_wc_index, fli_index) %>% 
+  na.omit()
+
+# 2. Tính ma trận tương quan (Dùng Spearman vì dữ liệu y khoa thường không phân phối chuẩn)
+cor_matrix <- cor(df_quant, method = "spearman")
+
+# Tính ma trận p-value để xem tương quan nào thực sự có ý nghĩa thống kê
+p_mat <- cor_pmat(df_quant, method = "spearman")
+
+new_names <- c(
+  "Age",
+  "BMI",
+  "GGT",
+  "CAP",
+  "FibroScan",
+  "TyG-WC",
+  "FLI"
+)
+
+colnames(cor_matrix) <- new_names
+rownames(cor_matrix) <- new_names
+
+colnames(p_mat) <- new_names
+rownames(p_mat) <- new_names
+
+library(corrplot)
+
+corrplot(
+  cor_matrix,
+  method = "color",
+  type = "lower",
+  order = "hclust",
+  addCoef.col = "black",
+  number.cex = 0.8,
+  tl.col = "black",
+  tl.srt = 45,
+  col = colorRampPalette(c("#2166AC", "white", "#B2182B"))(200),
+  p.mat = p_mat,
+  sig.level = 0.05,
+  insig = "blank"
+)
+```
+
