@@ -1,6 +1,10 @@
 ---
 title: "MASLD"
 format: docx
+execute:
+  echo: false
+  message: false
+  warning: false
 ---
 
 ```{r}
@@ -10,9 +14,11 @@ library(janitor)
 library(ggpubr)
 library(gtsummary)
 library(ggcorrplot)
-```
+library(rms)
+library(patchwork)
+library(logistf)
+library(pROC)
 
-```{r}
 df <- read_xlsx("data.xlsx", sheet = "Sheet3")
 ```
 
@@ -21,119 +27,295 @@ df <- df |> clean_names()
 colnames(df)
 ```
 
+## Chuẩn bị dữ liệu
+
 ```{r}
 df_clean <- df %>%
   mutate(
+    # Tính tuổi từ năm sinh
+    tuoi = 2026 - nam_sinh,
+    
     # 1. Phân độ gan nhiễm mỡ (Steatosis Grades)
     muc_do_nhiem_mo = case_when(
-      cap < 248 ~ "S0",
-      cap >= 248 & cap <= 267 ~ "S1",
-      cap >= 268 & cap <= 279 ~ "S2",
-      cap >= 280 ~ "S3",
+      cap < 244 ~ "S0",
+      cap >= 244 & cap < 269 ~ "S1",
+      cap >= 269 & cap < 296 ~ "S2",
+      cap >= 296 ~ "S3",
       TRUE ~ NA_character_
     ),
     
     # 2. Phân độ xơ hóa (Fibrosis Grades - Tạm dùng cut-off FibroScan)
     muc_do_xo_hoa = case_when(
-      fibro < 7.0 ~ "F0-F1",
-      fibro >= 7.0 & fibro < 9.5 ~ "F2",
-      fibro >= 9.5 & fibro < 12.5 ~ "F3",
-      fibro >= 12.5 ~ "F4",
+      fibro < 8.0 ~ "F0-F1",
+      fibro >= 8.0 & fibro < 12.0 ~ "F2",
+      fibro >= 12.0 & fibro < 20.0 ~ "F3",
+      fibro >= 20.0 ~ "F4",
       TRUE ~ NA_character_
     ),
     
     # 3. Yếu tố RLCH (Biến 0/1)
     co_rlch = if_else(
-      vong_eo_90_m_80_f == 1 |
-      glucose_100_mg_dl == 1 |
-      hba1c_5_7_percent == 1 | # Tùy clean_names() ra chữ percent hay không
+      (gioi == 1 & vong_eo_90_m_80_f >= 90) | (gioi == 0 & vong_eo_90_m_80_f >= 80) |
+      glucose_100_mg_dl >= 100 |
+      hba1c_5_7_percent >= 5.7| 
       dtd2 == 1 |
-      ha_130_85 == 1 |
       tha == 1 |
-      triglyceride_150_5mg_dl == 1 |
-      hdl_40_m_50_f == 1 |
+      ha_130_85 == 1 |
+      triglyceride_150_5mg_dl >= 150.5 |
+      (gioi == 1 & hdl_40_m_50_f <= 40) | (gioi == 0 & hdl_40_m_50_f <= 50) |
       thuoc_lipid == 1,
       1, 0
     ),
     
-    # 4. Chẩn đoán BGNMLQRLCH (MASLD)
-    bgnmlqrlch_chuan_doan = if_else(cap >= 248 & co_rlch == 1, "Có", "Không"),
-    bgnmlqrlch_binary = if_else(cap >= 248 & co_rlch == 1, 1, 0)
+    TyG = log(triglyceride_150_5mg_dl * glucose_100_mg_dl / 2),
+    
+    TyG_BMI = TyG * bmi,
+    
+    bgnmlqrlch_chuan_doan = if_else(cap >= 244 & co_rlch == 1, "Yes", "No"),
+    bgnmlqrlch_binary = if_else(cap >= 244 & co_rlch == 1, 1, 0),
+    
+    nhiem_mo_s2_plus = if_else(cap >= 269, 1, 0),
+    xo_hoa_f2_plus = if_else(fibro >= 8.0, 1, 0)
   )
 ```
 
+## Violin plots
+
+```{r fig.path="figures/", fig.width=10, fig.height=7, fig.dpi=300}
+library(ggh4x) 
+
+df_violin_grid <- df_clean %>%
+  select(bgnmlqrlch_binary, nhiem_mo_s2_plus, xo_hoa_f2_plus, ty_g_wc_index, fli_index, TyG_BMI, TyG) %>%
+  
+  pivot_longer(
+    cols = c(bgnmlqrlch_binary, nhiem_mo_s2_plus, xo_hoa_f2_plus),
+    names_to = "Outcome_Type",
+    values_to = "Outcome_Value"
+  ) %>%
+  
+  pivot_longer(
+    cols = c(ty_g_wc_index, fli_index, TyG_BMI, TyG),
+    names_to = "Index_Name",
+    values_to = "Index_Value"
+  ) %>%
+  drop_na(Outcome_Value, Index_Value) %>%
+  
+  mutate(
+
+    Outcome_Value = factor(Outcome_Value, levels = c(0, 1), labels = c("No", "Yes")),
+
+    Outcome_Type = factor(Outcome_Type,
+                          levels = c("bgnmlqrlch_binary", "nhiem_mo_s2_plus", "xo_hoa_f2_plus"),
+                          labels = c("MASLD", "Steatosis", "Fibrosis")),
+
+    Index_Name = factor(Index_Name,
+                        levels = c("TyG", "TyG_BMI", "ty_g_wc_index", "fli_index"),
+                        labels = c("TyG", "TyG-BMI", "TyG-WC", "FLI"))
+  )
+
+ggplot(df_violin_grid, aes(x = Outcome_Value, y = Index_Value, fill = Outcome_Value)) +
+  geom_violin(trim = FALSE, width = 0.5) +
+  geom_boxplot(width = 0.2, fill = "white", outlier.shape = NA) +
+  
+  facet_grid2(
+    Outcome_Type ~ Index_Name,
+    scales = "free_y",
+    independent = "y" 
+  ) +
+  theme_bw() +
+  scale_fill_manual(values = c("No" = "#589A99", "Yes" = "#FED3C2")) +
+  labs(
+    x = NULL,
+    y = "Value",
+    fill = "Status"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5, margin = margin(b = 15)),
+    
+    strip.text.x = element_text(face = "bold", size = 13),
+
+    strip.text.y = element_text(face = "bold", size = 12),
+    strip.background.x = element_rect(fill = "lightblue"),
+    strip.background.y = element_rect(fill = "gray"),
+    
+    axis.text.y = element_text(color = "black", size = 11),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    
+    legend.position = "bottom",
+    legend.text = element_text(color = "black", size = 13),
+    legend.title = element_text(face = "bold", size = 13)
+  )
+```
+
+## Mục tiêu 1
+
 ```{r}
-# Bảng 1: Chỉ số TyG-WC và FLI theo chẩn đoán BGNMLQRLCH
-tbl_bgnmlqrlch <- df_clean %>%
-  select(bgnmlqrlch_chuan_doan, ty_g_wc_index, fli_index) %>%
-  filter(!is.na(bgnmlqrlch_chuan_doan)) |> 
+tbl_mt1 <- df_clean %>%
+  select(
+
+    tuoi, gioi, bmi, vong_eo_90_m_80_f,
+
+    tha, dtd2, ha_130_85,
+
+    glucose_100_mg_dl, hba1c_5_7_percent,
+    triglyceride_150_5mg_dl, hdl_40_m_50_f, thuoc_lipid, ruou, ggt,
+
+    cap, fibro, ty_g_wc_index, fli_index, TyG, TyG_BMI,
+    # Biến phân nhóm
+    bgnmlqrlch_chuan_doan
+  ) %>%
   tbl_summary(
     by = bgnmlqrlch_chuan_doan,
     missing = "no",
-    statistic = list(all_continuous() ~ "{median} ({p25}, {p75})"), # Hoặc {mean} ({sd}) tùy phân phối
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
     label = list(
-      ty_g_wc_index ~ "Chỉ số TyG-WC",
-      fli_index ~ "Chỉ số FLI"
+      tuoi ~ "Age",
+      gioi ~ "Sex",
+      bmi ~ "BMI (kg/m2)",
+      vong_eo_90_m_80_f ~ "Waistline",
+      tha ~ "Hypertension",
+      dtd2 ~ "Diabetes",
+      ha_130_85 ~ "Blood Pressure (≥130/85 mmHg)",
+      glucose_100_mg_dl ~ "Glucose",
+      hba1c_5_7_percent ~ "HbA1c",
+      triglyceride_150_5mg_dl ~ "Triglyceride",
+      hdl_40_m_50_f ~ "HDL-C",
+      thuoc_lipid ~ "Lipid medicine",
+      ruou ~ "Alcohol",
+      ggt ~ "GGT",
+      ty_g_wc_index ~ "TyG-WC",
+      fli_index ~ "FLI"
     )
   ) %>%
-  add_p() %>%
   add_overall() %>%
-  modify_caption("**Bảng 1. So sánh TyG-WC và FLI theo chẩn đoán BGNMLQRLCH**")
+  add_p() %>%
+  modify_caption("**Table 1. Clinical and paraclinical characteristics associated with metabolic acidosis**")
 
-tbl_bgnmlqrlch
+tbl_mt1
 
-# Bảng 2: Chỉ số TyG-WC và FLI theo mức độ nhiễm mỡ (S0-S3)
-tbl_nhiem_mo <- df_clean %>%
-  select(muc_do_nhiem_mo, ty_g_wc_index, fli_index) %>%
-  filter(!is.na(muc_do_nhiem_mo)) %>%
+tbl_mt2 <- df_clean %>%
+  select(
+
+    tuoi, gioi, bmi, vong_eo_90_m_80_f,
+
+    tha, dtd2, ha_130_85,
+
+    glucose_100_mg_dl, hba1c_5_7_percent,
+    triglyceride_150_5mg_dl, hdl_40_m_50_f, thuoc_lipid, ruou, ggt,
+
+    cap, fibro, ty_g_wc_index, fli_index, TyG, TyG_BMI,
+    # Biến phân nhóm
+    muc_do_nhiem_mo
+  ) %>%
   tbl_summary(
     by = muc_do_nhiem_mo,
     missing = "no",
-    statistic = list(all_continuous() ~ "{median} ({p25}, {p75})")
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    label = list(
+      tuoi ~ "Age",
+      gioi ~ "Sex",
+      bmi ~ "BMI (kg/m2)",
+      vong_eo_90_m_80_f ~ "Waistline",
+      tha ~ "Hypertension",
+      dtd2 ~ "Diabetes",
+      ha_130_85 ~ "Blood Pressure (≥130/85 mmHg)",
+      glucose_100_mg_dl ~ "Glucose",
+      hba1c_5_7_percent ~ "HbA1c",
+      triglyceride_150_5mg_dl ~ "Triglyceride",
+      hdl_40_m_50_f ~ "HDL-C",
+      thuoc_lipid ~ "Lipid medicine",
+      ruou ~ "Alcohol",
+      ggt ~ "GGT",
+      ty_g_wc_index ~ "TyG-WC",
+      fli_index ~ "FLI"
+    )
   ) %>%
-  add_p() |> 
   add_overall() %>%
-  modify_caption("**Bảng 2. So sánh TyG-WC và FLI theo mức độ nhiễm mỡ**")
+  add_p() %>%
+  modify_caption("**Table 1. Clinical and paraclinical characteristics associated with metabolic acidosis**")
 
-tbl_nhiem_mo
+tbl_mt2
 
-# Bảng 3: Chỉ số TyG-WC và FLI theo mức độ xơ hóa (F0-F4)
-tbl_xo_hoa <- df_clean %>%
-  select(muc_do_xo_hoa, ty_g_wc_index, fli_index) %>%
-  filter(!is.na(muc_do_xo_hoa)) %>%
+tbl_mt3 <- df_clean %>%
+  select(
+
+    tuoi, gioi, bmi, vong_eo_90_m_80_f,
+
+    tha, dtd2, ha_130_85,
+
+    glucose_100_mg_dl, hba1c_5_7_percent,
+    triglyceride_150_5mg_dl, hdl_40_m_50_f, thuoc_lipid, ruou, ggt,
+
+    cap, fibro, ty_g_wc_index, fli_index, TyG, TyG_BMI,
+    # Biến phân nhóm
+    muc_do_xo_hoa
+  ) %>%
   tbl_summary(
     by = muc_do_xo_hoa,
     missing = "no",
-    statistic = list(all_continuous() ~ "{median} ({p25}, {p75})")
+    statistic = list(
+      all_continuous() ~ "{median} ({p25}, {p75})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    label = list(
+      tuoi ~ "Age",
+      gioi ~ "Sex",
+      bmi ~ "BMI (kg/m2)",
+      vong_eo_90_m_80_f ~ "Waistline",
+      tha ~ "Hypertension",
+      dtd2 ~ "Diabetes",
+      ha_130_85 ~ "Blood Pressure (≥130/85 mmHg)",
+      glucose_100_mg_dl ~ "Glucose",
+      hba1c_5_7_percent ~ "HbA1c",
+      triglyceride_150_5mg_dl ~ "Triglyceride",
+      hdl_40_m_50_f ~ "HDL-C",
+      thuoc_lipid ~ "Lipid medicine",
+      ruou ~ "Alcohol",
+      ggt ~ "GGT",
+      ty_g_wc_index ~ "TyG-WC",
+      fli_index ~ "FLI"
+    )
   ) %>%
-  add_p() |> 
   add_overall() %>%
-  modify_caption("**Bảng 3. So sánh TyG-WC và FLI theo mức độ xơ hóa**")
+  add_p() %>%
+  modify_caption("**Table 1. Clinical and paraclinical characteristics associated with metabolic acidosis**")
 
-tbl_xo_hoa
+tbl_mt3
 ```
+
+## Mục tiêu 2
 
 ```{r, fig.path="figures/", fig.height=7, fig.width=6, dpi=300}
 df_quant <- df_clean %>%
-  mutate(tuoi = 2026 - nam_sinh) %>% # Tính tuổi từ năm sinh
-  # Chỉ chọn những biến thực sự là định lượng liên tục
-  select(tuoi, bmi, ggt, cap, fibro, ty_g_wc_index, fli_index) %>% 
+  mutate(tuoi = 2026 - nam_sinh) %>% 
+  select(tuoi, bmi, vong_eo_90_m_80_f, triglyceride_150_5mg_dl, glucose_100_mg_dl, ggt, cap, fibro, ty_g_wc_index, fli_index,
+         TyG, TyG_BMI) %>% 
   na.omit()
 
-# 2. Tính ma trận tương quan (Dùng Spearman vì dữ liệu y khoa thường không phân phối chuẩn)
 cor_matrix <- cor(df_quant, method = "spearman")
 
-# Tính ma trận p-value để xem tương quan nào thực sự có ý nghĩa thống kê
 p_mat <- cor_pmat(df_quant, method = "spearman")
 
 new_names <- c(
   "Age",
   "BMI",
+  "WC",
+  "Triglyceride",
+  "Glucose",
   "GGT",
   "CAP",
   "FibroScan",
   "TyG-WC",
-  "FLI"
+  "FLI",
+  "TyG",
+  "TyG-BMI"
 )
 
 colnames(cor_matrix) <- new_names
@@ -158,5 +340,244 @@ corrplot(
   sig.level = 0.05,
   insig = "blank"
 )
+```
+
+```{r}
+df_model <- df_clean %>%
+  mutate(
+    gioi = as.factor(gioi),
+    tha = as.factor(tha)
+  ) %>%
+  drop_na(bgnmlqrlch_binary, tuoi, gioi, tha, ggt, TyG, TyG_BMI, ty_g_wc_index, fli_index) %>%
+  mutate(
+    TyG_Q = factor(ntile(TyG, 4), labels = c("Q1", "Q2", "Q3", "Q4")),
+    TyG_BMI_Q = factor(ntile(TyG_BMI, 4), labels = c("Q1", "Q2", "Q3", "Q4")),
+    TyG_WC_Q = factor(ntile(ty_g_wc_index, 4), labels = c("Q1", "Q2", "Q3", "Q4")),
+    FLI_Q = factor(ntile(fli_index, 4), labels = c("Q1", "Q2", "Q3", "Q4"))
+  )
+```
+
+## Odd Ratios by multivariate models
+
+```{r}
+export_full_table <- function(outcome_var, var_cont, var_quart, var_label, outcome_label) {
+
+  m1_c <- logistf(as.formula(paste(outcome_var, "~", var_cont)), data = df_model)
+  m2_c <- logistf(as.formula(paste(outcome_var, "~", var_cont, "+ tuoi + gioi")), data = df_model)
+  m3_c <- logistf(as.formula(paste(outcome_var, "~", var_cont, "+ tuoi + gioi + ggt + tha")), data = df_model)
+  
+  t1_c <- tbl_regression(m1_c, exponentiate = TRUE, include = all_of(var_cont))
+  t2_c <- tbl_regression(m2_c, exponentiate = TRUE, include = all_of(var_cont))
+  t3_c <- tbl_regression(m3_c, exponentiate = TRUE, include = all_of(var_cont))
+  
+  m1_q <- logistf(as.formula(paste(outcome_var, "~", var_quart)), data = df_model)
+  m2_q <- logistf(as.formula(paste(outcome_var, "~", var_quart, "+ tuoi + gioi")), data = df_model)
+  m3_q <- logistf(as.formula(paste(outcome_var, "~", var_quart, "+ tuoi + gioi + ggt + tha")), data = df_model)
+  
+  t1_q <- tbl_regression(m1_q, exponentiate = TRUE, include = all_of(var_quart))
+  t2_q <- tbl_regression(m2_q, exponentiate = TRUE, include = all_of(var_quart))
+  t3_q <- tbl_regression(m3_q, exponentiate = TRUE, include = all_of(var_quart))
+  
+  t1_stacked <- tbl_stack(list(t1_c, t1_q))
+  t2_stacked <- tbl_stack(list(t2_c, t2_q))
+  t3_stacked <- tbl_stack(list(t3_c, t3_q))
+  
+  tbl_merge(
+    tbls = list(t1_stacked, t2_stacked, t3_stacked),
+    tab_spanner = c("**Model 1**", "**Model 2**", "**Model 3**")
+  ) %>%
+    modify_caption(paste("**Table: Association between", var_label, "and", outcome_label, "**")) %>%
+    bold_labels()
+}
+
+export_full_table("bgnmlqrlch_binary", "ty_g_wc_index", "TyG_WC_Q", "TyG-WC", "MASLD")
+export_full_table("bgnmlqrlch_binary", "TyG_BMI", "TyG_BMI_Q", "TyG-BMI", "MASLD")
+export_full_table("bgnmlqrlch_binary", "TyG", "TyG_Q", "TyG", "MASLD")
+export_full_table("bgnmlqrlch_binary", "fli_index", "FLI_Q", "FLI", "MASLD")
+
+export_full_table("nhiem_mo_s2_plus", "ty_g_wc_index", "TyG_WC_Q", "TyG-WC", "Steatosis")
+export_full_table("nhiem_mo_s2_plus", "TyG_BMI", "TyG_BMI_Q", "TyG-BMI", "Steatosis")
+export_full_table("nhiem_mo_s2_plus", "TyG", "TyG_Q", "TyG", "Steatosis")
+export_full_table("nhiem_mo_s2_plus", "fli_index", "FLI_Q", "FLI", "Steatosis")
+
+export_full_table("xo_hoa_f2_plus", "ty_g_wc_index", "TyG_WC_Q", "TyG-WC", "Fibrosis")
+export_full_table("xo_hoa_f2_plus", "TyG_BMI", "TyG_BMI_Q", "TyG-BMI", "Fibrosis")
+export_full_table("xo_hoa_f2_plus", "TyG", "TyG_Q", "TyG", "Fibrosis")
+export_full_table("xo_hoa_f2_plus", "fli_index", "FLI_Q", "FLI", "Fibrosis")
+```
+
+## Mục tiêu 3
+
+```{r fig.path="figures/", fig.width=10, fig.height=4, fig.dpi=300}
+plot_roc_outcome <- function(outcome_col, plot_title) {
+  
+  roc_tyg     <- roc(df_model[[outcome_col]], df_model$TyG, ci = TRUE, quiet = TRUE)
+  roc_tyg_bmi <- roc(df_model[[outcome_col]], df_model$TyG_BMI, ci = TRUE, quiet = TRUE)
+  roc_tyg_wc  <- roc(df_model[[outcome_col]], df_model$ty_g_wc_index, ci = TRUE, quiet = TRUE)
+  roc_fli     <- roc(df_model[[outcome_col]], df_model$fli_index, ci = TRUE, quiet = TRUE)
+
+  label_tyg    <- paste0("TyG (", sprintf("%.2f", roc_tyg$auc), ")")
+  label_tygbmi <- paste0("TyG-BMI (", sprintf("%.2f", roc_tyg_bmi$auc), ")")
+  label_tygwc  <- paste0("TyG-WC (", sprintf("%.2f", roc_tyg_wc$auc), ")")
+  label_fli    <- paste0("FLI (", sprintf("%.2f", roc_fli$auc), ")")
+
+  roc_list <- list(roc_tyg, roc_tyg_bmi, roc_tyg_wc, roc_fli)
+  names(roc_list) <- c(label_tyg, label_tygbmi, label_tygwc, label_fli)
+
+  my_colors <- c("#1B4F72", "#C0392B", "#27AE60", "#F39C12", "#006D6F")
+  names(my_colors) <- c(label_tyg, label_tygbmi, label_tygwc, label_fli, "Reference")
+
+  ggroc(roc_list, legacy.axes = TRUE, linewidth = 0.8) +
+    geom_abline(aes(color = "Reference"), intercept = 0, slope = 1, linewidth = 0.8) +
+    scale_color_manual(name = NULL, values = my_colors) +
+    labs(x = "1 - Specificity", y = "Sensitivity", title = plot_title) +
+    theme_bw() +
+    theme(
+      panel.grid.major = element_line(color = "#E5EFEF", linewidth = 0.6),
+      panel.grid.minor = element_blank(),
+      plot.title = element_text(face = "bold", hjust = 0.5, size = 14),
+      axis.title = element_text(color = "black", size = 12),
+      axis.text = element_text(color = "black", size = 11),
+      
+      legend.position = c(0.70, 0.22),
+      legend.background = element_rect(color = "black", fill = "white", linewidth = 0.5),
+      legend.key = element_rect(fill = "white"),
+      legend.text = element_text(size = 9),
+      legend.title = element_blank() 
+    )
+}
+
+p_masld <- plot_roc_outcome("bgnmlqrlch_binary", "MASLD")
+p_steatosis <- plot_roc_outcome("nhiem_mo_s2_plus", "Steatosis")
+p_fibrosis <- plot_roc_outcome("xo_hoa_f2_plus", "Fibrosis")
+
+(p_masld | p_steatosis | p_fibrosis)
+```
+
+```{r}
+get_performance <- function(roc_obj, index_name, ref_roc = NULL) {
+  auc_val <- roc_obj$auc
+  ci_str  <- paste0(sprintf("%.2f", roc_obj$ci[1]), "-", sprintf("%.2f", roc_obj$ci[3]))
+  
+  c_best <- coords(roc_obj, "best", best.method = "youden", 
+                   ret = c("threshold", "sensitivity", "specificity", "ppv", "npv"), transpose = FALSE)
+  
+  cutoff <- c_best$threshold[1]
+  sen    <- c_best$sensitivity[1] * 100
+  spe    <- c_best$specificity[1] * 100
+  ppv    <- c_best$ppv[1] * 100
+  npv    <- c_best$npv[1] * 100
+  
+  if (is.null(ref_roc)) { p_str <- "-" } else {
+    p_val <- roc.test(roc_obj, ref_roc, method = "delong", quiet = TRUE)$p.value
+    p_str <- ifelse(p_val < 0.001, "<0.001", sprintf("%.3f", p_val))
+  }
+  
+  tibble(
+    Index = index_name,
+    AUROC = sprintf("%.2f", auc_val), `95% CI` = ci_str, `Cutoff Value` = sprintf("%.2f", cutoff),
+    `SEN (%)` = sprintf("%.1f", sen), `SPE (%)` = sprintf("%.1f", spe),
+    `PPV (%)` = sprintf("%.1f", ppv), `NPV (%)` = sprintf("%.1f", npv), `p Value` = p_str
+  )
+}
+
+# Hàm chạy cho 1 Outcome (4 chỉ số)
+get_outcome_perf_table <- function(outcome_col, outcome_label) {
+  r_tyg <- roc(df_model[[outcome_col]], df_model$TyG, ci = TRUE, quiet = TRUE)
+  r_tygbmi <- roc(df_model[[outcome_col]], df_model$TyG_BMI, ci = TRUE, quiet = TRUE)
+  r_tygwc <- roc(df_model[[outcome_col]], df_model$ty_g_wc_index, ci = TRUE, quiet = TRUE)
+  r_fli <- roc(df_model[[outcome_col]], df_model$fli_index, ci = TRUE, quiet = TRUE)
+  
+  bind_rows(
+    get_performance(r_tyg, "TyG index", r_fli),
+    get_performance(r_tygbmi, "TyG-BMI", r_fli),
+    get_performance(r_tygwc, "TyG-WC", r_fli),
+    get_performance(r_fli, "FLI", NULL)
+  ) %>%
+    mutate(Outcome = outcome_label) %>%
+    relocate(Outcome) # Đưa cột Outcome lên đầu
+}
+
+# Gom 3 bảng lại thành 1 bảng khổng lồ
+full_perf_table <- bind_rows(
+  get_outcome_perf_table("bgnmlqrlch_binary", "MASLD"),
+  get_outcome_perf_table("nhiem_mo_s2_plus", "Steatosis"),
+  get_outcome_perf_table("xo_hoa_f2_plus", "Fibrosis")
+)
+
+knitr::kable(full_perf_table, align = c("l", "l", "c", "c", "c", "c", "c", "c", "c", "c"),
+             caption = "**Table 5: Diagnostic performance of non-invasive indices for 3 outcomes**")
+```
+
+## Restricted Cubic Splines
+
+```{r}
+dd <- datadist(df_model)
+options(datadist = "dd")
+
+create_rcs_grid <- function(outcome_var, grid_title) {
+  
+  plot_rcs_with_cutoff <- function(var_name, var_label) {
+    f <- as.formula(paste(outcome_var, "~ rcs(", var_name, ", 3)"))
+    fit <- lrm(f, data = df_model, penalty = 0.5)
+    
+    pred <- Predict(fit, name = var_name, fun = exp, ref.zero = TRUE)
+    df_pred <- as.data.frame(pred)
+    
+    p1 <- quantile(df_model[[var_name]], 0.01, na.rm = TRUE)
+    p99 <- quantile(df_model[[var_name]], 0.99, na.rm = TRUE)
+    df_pred_filtered <- df_pred %>% filter(.data[[var_name]] >= p1 & .data[[var_name]] <= p99)
+    
+    ref_x <- df_pred_filtered %>% filter(yhat == min(yhat)) %>% pull(.data[[var_name]])
+    ref_x <- ref_x[1] 
+    
+    cutoff_row <- df_pred_filtered %>% filter(.data[[var_name]] > ref_x, yhat >= 1.0) %>% slice(1)
+    cutoff_val <- ifelse(nrow(cutoff_row) > 0, cutoff_row[[var_name]], NA)
+    
+    p <- ggplot(df_pred_filtered, aes(x = .data[[var_name]], y = yhat)) +
+        geom_line(color = "#B2182B", linewidth = 1.2) +
+        geom_ribbon(aes(ymin = lower, ymax = upper), fill = "#B2182B", alpha = 0.2) +
+        geom_hline(yintercept = 1, linetype = "dashed", color = "gray50") +
+        theme_bw() +
+        labs(x = var_label, y = "Odds Ratio (OR)") +
+        coord_cartesian(ylim = c(0, 5)) +
+        theme(
+            axis.title = element_text(size = 14, face = "bold"),
+            axis.text = element_text(color = "black", size = 12)
+        )
+    
+    if (!is.na(cutoff_val)) {
+        p <- p + 
+            annotate("point", x = cutoff_val, y = 1.0, color = "black", size = 3) +
+            annotate("text", x = cutoff_val, y = 0.8, 
+                     label = paste0("Ref: ", round(cutoff_val, 2)), 
+                     color = "black", fontface = "bold", size = 4.5, hjust = -0.1)
+    }
+    return(p)
+  }
+  
+  p_tyg    <- plot_rcs_with_cutoff("TyG", "TyG")
+  p_tygbmi <- plot_rcs_with_cutoff("TyG_BMI", "TyG-BMI")
+  p_tygwc  <- plot_rcs_with_cutoff("ty_g_wc_index", "TyG-WC")
+  p_fli    <- plot_rcs_with_cutoff("fli_index", "FLI")
+  
+  (p_tyg | p_tygbmi) / (p_tygwc | p_fli) + 
+      plot_annotation(
+          title = grid_title,
+          theme = theme(plot.title = element_text(face = "bold", size = 16, hjust = 0.5))
+      )
+}
+```
+
+```{r fig.path="figures/", fig.width=7, fig.height=5, fig.dpi=300}
+create_rcs_grid("bgnmlqrlch_binary", "")
+```
+
+```{r fig.path="figures/", fig.width=7, fig.height=7, fig.dpi=300}
+create_rcs_grid("nhiem_mo_s2_plus", "")
+```
+
+```{r fig.path="figures/", fig.width=7, fig.height=5, fig.dpi=300}
+create_rcs_grid("xo_hoa_f2_plus", "")
 ```
 
